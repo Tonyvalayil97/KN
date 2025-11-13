@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# Streamlit – Universal Air Freight Invoice Extractor (KLN + Kuehne & Nagel)
+# Streamlit – Kuehne + Nagel Invoice Extractor (13 fields)
 
 import io
-import os
 import re
 import traceback
 from datetime import datetime
@@ -13,187 +12,97 @@ import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 
-# --------------------------------------------------------------
-# Extract numeric invoice ID from filename (ex: 26693 or 26693A)
-# --------------------------------------------------------------
+# ------------------------------------------------------------
+# Extract only the invoice number (Example: 2400047153)
+# ------------------------------------------------------------
 def extract_invoice_id(filename: str):
     name = filename.upper()
-    m = re.search(r"(\d{4,6}[A-Z]?)", name)
+    m = re.search(r"(\d{6,12})", name)
     if m:
         return m.group(1)
     return filename
 
 
-# --------------------------------------------------------------
-# Extract currency from filename only
-# --------------------------------------------------------------
-def extract_currency_from_filename(filename: str):
-    name = filename.upper()
-    if " CAD" in name:
-        return "CAD"
-    if " USD" in name:
-        return "USD"
-    if " EUR" in name:
-        return "EUR"
-    return None
-
-
-# --------------------------------------------------------------
-# Required output columns
-# --------------------------------------------------------------
+# ------------------------------------------------------------
+# Column order (13 fields)
+# ------------------------------------------------------------
 HEADERS = [
     "Timestamp", "Filename", "Invoice_Date", "Currency", "Shipper",
     "Weight_KG", "Volume_M3", "Chargeable_KG", "Chargeable_CBM",
     "Pieces", "Subtotal", "Freight_Mode", "Freight_Rate"
 ]
 
-
-# --------------------------------------------------------------
-# REGEX patterns for multiple invoice formats
-# --------------------------------------------------------------
-
-# Invoice date (supports yyyy-mm-dd and dd.mm.yyyy)
-INVOICE_DATE_PAT = re.compile(
-    r"(?:INVOICE DATE|INVOICE NO\.?\/ DATE|DATE)\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})",
-    re.I
-)
-
-# Shipper Name (KLN)
-SHIPPER_PAT_KLN = re.compile(
-    r"SHIPPER'S NAME.*?\n(.+)",
-    re.I
-)
-
-# Shipper Name (Kuehne & Nagel)
-SHIPPER_PAT_KN = re.compile(
-    r"SHIPPER\s*:\s*(.+)",
-    re.I
-)
-
-# Packages
-PIECES_PAT = re.compile(r"\b(\d+)\s+PACKAGE", re.I)
-
-# Weight
-WEIGHT_PAT = re.compile(r"Gross Weight.*?([\d.]+)\s*KG", re.I)
-
-# Volume (CBM)
-VOLUME_PAT = re.compile(r"([\d.]+)\s*CBM", re.I)
-
-# Chargeable weight
-CHARGEABLE_KG_PAT = re.compile(r"Chargeable Weight.*?([\d.]+)", re.I)
-
-# KLN volume weight KG (convert to CBM)
-VOLUME_WEIGHT_KG_PAT = re.compile(r"Volume Weight[:\s]+([\d.]+)", re.I)
-
-# Subtotal (Total)
-SUBTOTAL_PAT = re.compile(
-    r"Total\s*[:\-]?\s*([\d,]+\.\d{2})",
-    re.I
-)
-
-# KLN Freight Amount (last value on AIR FREIGHT line)
-KLN_FREIGHT_AMOUNT_PAT = re.compile(
-    r"AIR FREIGHT[^\n]*?([\d,]+\.\d{2})\s*$",
-    re.I | re.M
-)
-
-# Kuehne + Nagel AIRFREIGHT USD amount (Option A)
-KN_FREIGHT_USD_PAT = re.compile(
-    r"AIRFREIGHT.*?USD\s*([\d,]+\.\d{2})",
-    re.I
-)
-
-
-# --------------------------------------------------------------
-# UNIVERSAL PARSER (supports KLN + Kuehne+Nagel)
-# --------------------------------------------------------------
+# ------------------------------------------------------------
+# Main parser (KN SALES INVOICE FORMAT)
+# ------------------------------------------------------------
 def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, Any]]:
 
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+            text = "\n".join((p.extract_text() or "") for p in pdf.pages)
 
-        # -------- Invoice Date --------
+        # ------------------ Invoice Number & Date ------------------
         inv_date = None
-        m = INVOICE_DATE_PAT.search(text)
+        m = re.search(r"INVOICE NO\.?\s*\/\s*DATE\s*\d+\s+(\d{2}\.\d{2}\.\d{4})", text)
         if m:
-            date_str = m.group(1).strip()
-            if "." in date_str:  # dd.mm.yyyy
-                d, mth, y = date_str.split(".")
-                inv_date = f"{y}-{mth}-{d}"
-            else:
-                inv_date = date_str
+            d, mth, y = m.group(1).split(".")
+            inv_date = f"{y}-{mth}-{d}"
 
-        # -------- Currency (from filename only) --------
-        currency = extract_currency_from_filename(filename)
+        # ------------------ Currency (USD from subtotal) ------------------
+        currency = None
+        m = re.search(r"SUBTOTAL\s+(USD|CAD|EUR)\s+[\d,]+\.\d{2}", text)
+        if m:
+            currency = m.group(1).upper()
 
-        # -------- Shipper --------
+        # ------------------ Shipper ------------------
         shipper = None
-        m = SHIPPER_PAT_KLN.search(text)
-        if not m:
-            m = SHIPPER_PAT_KN.search(text)
+        m = re.search(r"SHIPPER\s*:\s*(.+)", text)
         if m:
             shipper = m.group(1).strip()
 
-        # -------- Pieces --------
+        # ------------------ Pieces ------------------
         pieces = None
-        m = PIECES_PAT.search(text)
+        m = re.search(r"(\d+)\s+PCS", text)
         if m:
             pieces = int(m.group(1))
 
-        # -------- Weight (KG) --------
+        # ------------------ Weight ------------------
         weight = None
-        m = WEIGHT_PAT.search(text)
+        m = re.search(r"GROSS WT\.?\s*\/\s*KG\s*([\d.]+)", text)
         if m:
             weight = float(m.group(1))
 
-        # -------- Volume (CBM) --------
-        volume_m3 = None
-        m = VOLUME_PAT.search(text)
+        # ------------------ Volume (CBM) ------------------
+        volume = None
+        m = re.search(r"VOLUME\s*\/\s*CBM\s*([\d.]+)", text)
         if m:
-            volume_m3 = float(m.group(1))
-        else:
-            # KLN Volume KG → convert to CBM
-            m = VOLUME_WEIGHT_KG_PAT.search(text)
-            if m:
-                volume_weight_kg = float(m.group(1))
-                volume_m3 = volume_weight_kg / 167.0
+            volume = float(m.group(1))
 
-        # -------- Chargeable KG --------
+        # ------------------ Chargeable Weight ------------------
         chargeable_kg = None
-        m = CHARGEABLE_KG_PAT.search(text)
+        m = re.search(r"CHG\.?\s*WT\.?\s*([\d.]+)", text)
         if m:
             chargeable_kg = float(m.group(1))
-        elif weight and volume_m3:
-            chargeable_kg = max(weight, volume_m3 * 167)
 
-        # -------- Chargeable CBM --------
-        chargeable_cbm = volume_m3
+        # ------------------ Chargeable CBM ------------------
+        chargeable_cbm = volume
 
-        # -------- Freight Mode --------
-        f_mode = "Air"
-
-        # -------- Freight Rate (Option A for Kuehne + Nagel) --------
-        f_rate = None
-
-        # KN logic first
-        m = KN_FREIGHT_USD_PAT.search(text)
-        if m:
-            f_rate = float(m.group(1).replace(",", ""))
-
-        # KLN fallback
-        if f_rate is None:
-            m = KLN_FREIGHT_AMOUNT_PAT.search(text)
-            if m:
-                f_rate = float(m.group(1).replace(",", ""))
-
-        # -------- Subtotal --------
+        # ------------------ Subtotal ------------------
         subtotal = None
-        m = SUBTOTAL_PAT.search(text)
+        m = re.search(r"SUBTOTAL\s+[A-Z]{3}\s+([\d,]+\.\d{2})", text)
         if m:
             subtotal = float(m.group(1).replace(",", ""))
 
-        # -------- Build Output Row --------
+        # ------------------ Freight Mode ------------------
+        f_mode = "Air"  # always Air for these invoices
+
+        # ------------------ Freight Rate (Option A) ------------------
+        f_rate = None
+        m = re.search(r"AIRFREIGHT.*?USD\s*([\d,]+\.\d{2})", text)
+        if m:
+            f_rate = float(m.group(1).replace(",", ""))
+
+        # ------------------ Build output row ------------------
         return {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Filename": extract_invoice_id(filename),
@@ -201,7 +110,7 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
             "Currency": currency,
             "Shipper": shipper,
             "Weight_KG": weight,
-            "Volume_M3": volume_m3,
+            "Volume_M3": volume,
             "Chargeable_KG": chargeable_kg,
             "Chargeable_CBM": chargeable_cbm,
             "Pieces": pieces,
@@ -215,27 +124,21 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
         return None
 
 
-# --------------------------------------------------------------
-# STREAMLIT UI
-# --------------------------------------------------------------
+# ------------------------------------------------------------
+# Streamlit UI
+# ------------------------------------------------------------
 st.set_page_config(
-    page_title="Air Freight Invoice Extractor",
-    page_icon="📄",
+    page_title="KN Invoice Extractor",
+    page_icon="📦",
     layout="wide",
 )
 
-st.title("📄 Air Freight Invoice → Excel Extractor")
-st.caption("Supports KLN Freight + Kuehne & Nagel PDFs")
+st.title("📦 Kuehne + Nagel Invoice → Excel Extractor")
+st.caption("Extracts 13 required fields from KN Sales Invoice PDFs.")
 
-uploads = st.file_uploader(
-    "Upload PDF files",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
+uploads = st.file_uploader("Upload KN Invoice PDFs", type=["pdf"], accept_multiple_files=True)
 
-extract_btn = st.button("Extract", type="primary", disabled=not uploads)
-
-if extract_btn and uploads:
+if st.button("Extract", type="primary") and uploads:
 
     rows = []
     progress = st.progress(0)
@@ -247,16 +150,15 @@ if extract_btn and uploads:
         if row:
             rows.append(row)
         else:
-            st.warning(f"❌ Failed to extract {f.name}")
+            st.warning(f"⚠ Could not extract: {f.name}")
         progress.progress(i / total)
 
     if rows:
         df = pd.DataFrame(rows).reindex(columns=HEADERS)
-
         st.subheader("Preview")
         st.dataframe(df, use_container_width=True)
 
-        # Build Excel
+        # Excel export
         output = io.BytesIO()
         wb = Workbook()
         ws = wb.active
@@ -269,9 +171,10 @@ if extract_btn and uploads:
         output.seek(0)
 
         st.download_button(
-            "⬇️ Download Invoice_Summary.xlsx",
+            "⬇ Download Invoice_Summary.xlsx",
             data=output,
             file_name="Invoice_Summary.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
 
